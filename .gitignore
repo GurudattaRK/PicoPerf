@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+out_*
+*_inst
+prime
+
+# PGO profile data
+pgo_data/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+*.DS_Store
