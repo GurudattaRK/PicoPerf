@@ -8,7 +8,7 @@
  *   echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
  */
 
-#include "time.h"
+#include "picoperf.h"
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -71,11 +71,12 @@ static void print_result(const char *label, const BenchResult *r) {
     print_sep();
 
     r->ok[CI_L1D_MISS] ? print_u("L1D misses", r->c[CI_L1D_MISS]) : print_na("L1D misses");
-    print_na("LLC misses");
+    r->ok[CI_L3_MISS] ? print_u("L3 misses", r->c[CI_L3_MISS]) : print_na("L3 misses");
 
     print_sep();
 
     print_u("tsc ticks", r->tsc_ticks);
+    print_u("nanoseconds", r->nanoseconds);
 
     std::cout << "\n";
 }
