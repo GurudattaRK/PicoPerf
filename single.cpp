@@ -1,10 +1,9 @@
 /*
- * single.cpp  --  Run workload once, print results. No warmup.
+ * single.cpp  --  Run the workload once and print the results. No warmup.
  *
- * Build:
- *   g++ -O3 -march=native -funroll-loops single.cpp time.o -o single
+ * Build & run:  make run        (or: g++ -O3 -march=native single.cpp picoperf.o -o out_single)
  *
- * Setup (once per boot):
+ * One-time per boot (lets you measure without sudo):
  *   echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
  */
 
@@ -82,15 +81,13 @@ static void print_result(const char *label, const BenchResult *r) {
 }
 
 int main() {
-    picoperf_setup(0);  // pin, mlockall, SCHED_FIFO, sysfs checks, init counters
-
     constexpr size_t N = 1024 * 1024;
     std::vector<uint32_t> data(N);
 
     for (size_t i = 0; i < N; ++i)
         data[i] = static_cast<uint32_t>(i * 2654435761ULL);
 
-    start_measuring();
+    start_measuring();  // first call auto-runs picoperf_setup(0): pin, lock, RT priority
     uint64_t s = sum_array(data);
     KEEP(s);
     BenchResult r = stop_measuring();

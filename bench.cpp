@@ -1,10 +1,9 @@
 /*
- * bench.cpp  --  Multi-run benchmark, last / avg / min table.
+ * bench.cpp  --  Run the workload many times and report min / p50 / p99 / p99.9.
  *
- * Build:
- *   g++ -O3 -march=native -funroll-loops bench.cpp time.o -o bench
+ * Build & run:  make bench
  *
- * Setup (once per boot):
+ * One-time per boot (lets you measure without sudo):
  *   echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
  */
 

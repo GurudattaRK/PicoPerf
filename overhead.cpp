@@ -6,10 +6,9 @@
  * 2. Overhead measurement (empty start/stop)
  * 3. Percentile analysis (min, p50, p99, p99.9)
  *
- * Build:
- *   g++ -O3 -march=native -funroll-loops overhead.cpp time.o -o overhead
+ * Build & run:  make overhead
  *
- * Setup (once per boot):
+ * One-time per boot (lets you measure without sudo):
  *   echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
  */
 
@@ -17,7 +16,7 @@
 #include <iostream>
 
 int main() {
-    // Setup: pin, mlockall, SCHED_FIFO, sysfs environment checks
+    // Pin to CPU 0, lock pages, ask for real-time priority, check the environment.
     picoperf_setup(0);
     
     std::cout << "\n=== Measurement Overhead Analysis ===\n\n";

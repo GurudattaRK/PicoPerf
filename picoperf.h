@@ -3,6 +3,7 @@
 
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 // Prevent dead code elimination
 #define KEEP(x) __asm__ volatile("" : "+r,m"(x) :: "memory")
@@ -30,11 +31,12 @@ typedef struct {
 extern "C" {
 #endif
 
-__attribute__((noinline)) void        start_measuring(void);
-__attribute__((noinline)) BenchResult stop_measuring(void);
+void        start_measuring(void);
+BenchResult stop_measuring(void);
 void        print_measured_results(BenchResult r);
 void        pin_to_cpu(int cpu_id);
 void        picoperf_setup(int cpu_id);
+void        picoperf_lock_memory(void *addr, size_t len);
 void        picoperf_fini(void);
 BenchResult measure_overhead(void);
 void        print_overhead_stats(int iterations);
