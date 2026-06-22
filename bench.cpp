@@ -202,6 +202,8 @@ static void run(const char *label, const std::vector<uint32_t>& data) {
 }
 
 int main() {
+    picoperf_setup(0);  // pin, mlockall, SCHED_FIFO, sysfs checks, init counters
+
     constexpr size_t NS =     4*1024;        // 16 KB -- L1 resident
     constexpr size_t NM =  1024*1024;        //  4 MB -- spills to L3
     constexpr size_t NL = 16*1024*1024;      // 64 MB -- DRAM pressure

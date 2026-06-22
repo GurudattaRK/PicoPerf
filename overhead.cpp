@@ -17,8 +17,8 @@
 #include <iostream>
 
 int main() {
-    // Pin to CPU 0 for deterministic results
-    pin_to_cpu(0);
+    // Setup: pin, mlockall, SCHED_FIFO, sysfs environment checks
+    picoperf_setup(0);
     
     std::cout << "\n=== Measurement Overhead Analysis ===\n\n";
     std::cout << "This measures the cost of start_measuring() -> stop_measuring()\n";

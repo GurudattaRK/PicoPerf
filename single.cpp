@@ -82,9 +82,11 @@ static void print_result(const char *label, const BenchResult *r) {
 }
 
 int main() {
+    picoperf_setup(0);  // pin, mlockall, SCHED_FIFO, sysfs checks, init counters
+
     constexpr size_t N = 1024 * 1024;
     std::vector<uint32_t> data(N);
-    
+
     for (size_t i = 0; i < N; ++i)
         data[i] = static_cast<uint32_t>(i * 2654435761ULL);
 

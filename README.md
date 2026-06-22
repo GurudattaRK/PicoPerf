@@ -41,15 +41,18 @@ uint64_t sum_array(const uint32_t *data, size_t n) {
 }
 
 int main() {
+    picoperf_setup(0);  // pin to CPU, mlockall, SCHED_FIFO, environment checks
+
     uint32_t data[1000000];
     // ... initialize data ...
-    
+
     start_measuring();
     uint64_t result = sum_array(data, 1000000);
     KEEP(result);  // prevent dead code elimination
     BenchResult r = stop_measuring();
-    
+
     print_measured_results(r);
+    picoperf_fini();
     return 0;
 }
 ```
@@ -97,16 +100,85 @@ cat /sys/devices/system/cpu/cpufreq/boost
 cat /sys/devices/system/cpu/intel_pstate/no_turbo
 ```
 
+## Root-Level Tuning (Recommended for Higher Accuracy)
+
+`picoperf_setup()` automatically attempts several system optimizations and warns
+to stderr when they fail or the environment is misconfigured. **Run as root for
+full effect.**
+
+### What `picoperf_setup` does automatically
+
+| Action | Root needed? | Effect |
+|--------|-------------|--------|
+| `sched_setaffinity` (CPU pin) | No | Prevents thread migration between cores |
+| `mlockall(MCL_CURRENT\|MCL_FUTURE)` | Yes (or `ulimit -l unlimited`) | Locks all pages in RAM, prevents page faults mid-measurement |
+| `sched_setscheduler(SCHED_FIFO)` | Yes | Real-time priority, OS scheduler won't preempt the thread |
+| sysfs SMT check | No (read-only) | Warns if Hyper-Threading is active |
+| sysfs governor check | No (read-only) | Warns if CPU frequency scaling is on |
+| sysfs turbo/boost check | No (read-only) | Warns if turbo/boost can skew cycle counts |
+
+### What requires manual root intervention
+
+These cannot be done from user code and must be configured system-wide:
+
+```bash
+# 1. Disable SMT/Hyper-Threading (sibling shares PMU, pollutes counts)
+echo off | sudo tee /sys/devices/system/cpu/smt/control
+
+# 2. Isolate benchmark CPU from kernel scheduler and IRQs
+#    Add to kernel boot params (e.g. GRUB_CMDLINE_LINUX in /etc/default/grub):
+#    isolcpus=3 nohz_full=3 rcu_nocbs=3
+#    Then rebuild grub: sudo update-grub && sudo reboot
+
+# 3. Pin all IRQs away from the isolated core (after isolcpus)
+sudo systemctl stop irqbalance
+for irq in /proc/irq/*/smp_affinity; do
+    echo 7 | sudo tee $irq > /dev/null  # avoid CPU 3 (binary 0111 = cores 0,1,2)
+done
+
+# 4. Disable CPU frequency scaling (governor + turbo/boost)
+sudo cpupower frequency-set -g performance
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo  # Intel
+echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost          # AMD
+```
+
+### Accuracy without root
+
+Running without root still gives useful results:
+- CPU pinning works (no root required)
+- Multiplexing is detected and aborts immediately - no silent data corruption
+- Group leader mode ensures all 6 counters start/stop atomically
+- Remaining noise sources: OS scheduler preemption, IRQs hitting your core,
+  page faults, turbo frequency jitter
+
+For workloads > 10µs, non-root results are reliable. For sub-microsecond
+workloads, the full root setup above is required for p99/p99.9 accuracy.
+
 ## API
 
 ```c
-void start_measuring(void);
-BenchResult stop_measuring(void);
-void print_measured_results(BenchResult r);
-void pin_to_cpu(int cpu_id);
-BenchResult measure_overhead(void);
-void print_overhead_stats(int iterations);
+// Core measurement
+void        start_measuring(void);          // reset+enable all counters, read TSC
+BenchResult stop_measuring(void);           // read TSC, disable all counters, read counts
+void        print_measured_results(BenchResult r);
+
+// Setup (call once before any measurement)
+void        picoperf_setup(int cpu_id);     // pin + mlockall + SCHED_FIFO + sysfs checks
+void        picoperf_fini(void);            // close all perf fds, reset state
+
+// Lower-level
+void        pin_to_cpu(int cpu_id);         // affinity only, no other setup
+BenchResult measure_overhead(void);         // cost of empty start→stop
+void        print_overhead_stats(int n);    // percentile overhead report over n iterations
 ```
+
+### Error behaviour
+
+- **Multiplexing detected** (`time_running < time_enabled`): prints to stderr and `exit(1)`.
+  This means counter values would be interpolated, not real hardware reads.
+- **`read()` failure on a counter fd**: prints to stderr and `exit(1)`.
+- **Group leader open failure** (cycles counter): prints instructions and `exit(1)`.
+- Member counters that fail to open are silently marked unavailable (`ok[i]=0`).
 
 ### Important Macros
 
@@ -126,39 +198,57 @@ __attribute__((noinline))  // Prevent function inlining
 ### PMU Counters
 
 - Uses `perf_event_open(2)` syscall
-- 6 counters fit in hardware (no multiplexing)
-- Atomic start/stop via `ioctl`
+- **Group leader mode**: `CI_CYCLES` is the group leader; the other 5 counters are
+  group members. One `ioctl` with `PERF_IOC_FLAG_GROUP` starts and stops all 6 atomically
+- 6 counters fit in hardware on all modern x86 without multiplexing (Intel uses
+  fixed-function counters for cycles+instructions, leaving 4 general-purpose PMCs
+  for the rest; AMD Zen 2/3/4 has 6 general-purpose PMCs)
+- Each counter fd is opened with `PERF_FORMAT_TOTAL_TIME_ENABLED |
+  PERF_FORMAT_TOTAL_TIME_RUNNING`; if `time_running < time_enabled`, multiplexing
+  is detected and the process aborts immediately
 
 ### Measurement Window
 
 ```
-lfence → rdtsc → enable counters → YOUR CODE → disable counters → rdtscp → lfence
+lfence → rdtsc → [all 6 counters enabled atomically] → YOUR CODE → [all 6 counters disabled atomically] → rdtscp → lfence
 ```
 
-All counters cover exactly the same instruction window.
+All counters see the same instruction window. The TSC window is slightly narrower
+than the PMU window by one `ioctl` round-trip at each end — this is the
+irreducible overhead measured by `measure_overhead()`.
 
 ## Caveats
 
 - **x86-64 Linux only** - uses `rdtsc`/`rdtscp` and `perf_event_open`
-- **No overhead subtraction** - raw measurements only (overhead is ~30-60 TSC ticks)
+- **No overhead subtraction** - raw measurements only; use `measure_overhead()` to
+  characterize the floor and subtract manually if needed
 - **Requires kernel 2.6.31+** - for `perf_event_open` support
-- **6 counter limit** - more counters cause kernel multiplexing (less accurate)
+- **6 counter limit** - more counters cause kernel multiplexing; PicoPerf detects
+  multiplexing and aborts rather than returning interpolated values
+- **`exit(1)` on any data integrity failure** - no silent garbage values. Multiplexing,
+  counter read errors, and group leader open failures all abort immediately
 
 ## Files
 
 - `picoperf.h` - Public API
 - `picoperf.c` - Implementation
 - `single.cpp` - Single-run example
-- `bench.cpp` - Statistical benchmark (1000 runs, percentiles)
+- `bench.cpp` - Statistical benchmark example(1000 runs, percentiles)
 - `overhead.cpp` - Overhead measurement tool
 
 ## Performance Tips
 
-1. **Pin to CPU** - `pin_to_cpu(0)` prevents thread migration
-2. **Warmup** - Run workload 1000 times before measuring
-3. **Disable frequency scaling** - Set governor to `performance`
-4. **Mark functions noinline** - Prevents compiler from moving code
-5. **Use KEEP()** - Prevents dead code elimination
+1. **Use `picoperf_setup(0)`** - call once at program start; handles pinning,
+   memory locking, real-time scheduling, and environment validation in one call
+2. **Warmup** - Run workload 1000 times before measuring (see `bench.cpp`)
+3. **Disable frequency scaling** - Set governor to `performance` and disable turbo/boost
+4. **Mark measured functions `noinline`** - Prevents compiler from moving code
+   across the start/stop boundary
+5. **Use `KEEP(result)`** - Prevents the compiler from eliminating your workload
+   as dead code
+6. **Run as root** - Enables `mlockall` and `SCHED_FIFO` for lowest jitter
+7. **Isolate the core** - `isolcpus=N` boot param removes the core from OS
+   scheduler and interrupt routing entirely
 
 ## Measurement Overhead
 

@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#include "picoperf.h"
 #include <linux/perf_event.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <asm/unistd.h>
@@ -51,14 +53,6 @@ static inline uint64_t tsc_end(void) {
 
 typedef struct { uint32_t type; uint64_t config; const char *name; } CDef;
 
-// 6 counters - fits in hardware without multiplexing
-#define CI_CYCLES     0
-#define CI_INSTRS     1
-#define CI_BRANCHES   2
-#define CI_BMISSES    3
-#define CI_L1D_MISS   4
-#define CI_L3_MISS    5
-#define NC            6
 
 static const CDef DEFS[NC] = {
     [CI_CYCLES]    = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES,          "cycles"          },
@@ -72,27 +66,20 @@ static const CDef DEFS[NC] = {
     [CI_L3_MISS]   = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES,        "l3_miss"         },
 };
 
-// Internal result structure
-
+// Read buffer - one entry per fd when read_format has PERF_FORMAT_TOTAL_TIME_ENABLED
+//               and PERF_FORMAT_TOTAL_TIME_RUNNING; used to detect multiplexing
 typedef struct {
-    uint64_t tsc_ticks;        // fixed-freq reference ticks
-    uint64_t nanoseconds;      // TSC converted to nanoseconds
-    uint64_t c[NC];            // raw counter values, indexed by CI_* constants
-    // Derived
-    double   ipc;              // instructions / cycles
-    double   cpi;              // cycles / instructions
-    double   branch_miss_pct;  // branch_misses / branches * 100
-    double   l1d_miss_pct;     // l1d_misses / l1d_refs * 100
-    int      ok[NC];           // 1 if this counter was available
-} BenchResult;
+    uint64_t value;
+    uint64_t time_enabled;
+    uint64_t time_running;
+} PerfReadBuf;
 
 // Global context - file descriptors for perf counters
 
 typedef struct {
-    int      fd[NC];
+    int      fd[NC];   // fd[CI_CYCLES] is the group leader
     int      ok[NC];
     uint64_t val[NC];
-    uint64_t baseline[NC];
 } BenchCtx;
 
 static BenchCtx g_ctx;
@@ -100,8 +87,8 @@ static uint64_t g_t0;
 static int g_initialized = 0;
 static uint64_t g_tsc_freq_hz = 0;  // TSC frequency in Hz
 
-static long _perf_open(struct perf_event_attr *a) {
-    return syscall(__NR_perf_event_open, a, 0, -1, -1, 0);
+static long _perf_open(struct perf_event_attr *a, int group_fd) {
+    return syscall(__NR_perf_event_open, a, 0, -1, group_fd, 0);
 }
 
 // TSC frequency detection:
@@ -121,26 +108,26 @@ static uint64_t _detect_tsc_freq(void) {
         fclose(f);
     }
 
-    // Method 2: Calibrate against CLOCK_MONOTONIC
-    // Run for 100ms and measure TSC ticks
-    struct timespec ts_start, ts_end;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    // Method 2: busy-wait calibration against CLOCK_MONOTONIC (100ms)
+    // Busy-wait keeps the CPU active, preventing C-state entry and frequency drops
+    // that would corrupt the TSC/wall-clock ratio
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t t0_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     uint64_t tsc_begin = tsc_start();
-    
-    // Busy wait for ~100ms
-    struct timespec sleep_time = {0, 100000000};  // 100ms
-    nanosleep(&sleep_time, NULL);
-    
+
+    uint64_t now_ns;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    } while (now_ns - t0_ns < 100000000ULL);
+
     uint64_t tsc_finish = tsc_end();
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    
-    uint64_t tsc_delta = tsc_finish - tsc_begin;
-    uint64_t ns_delta = (ts_end.tv_sec - ts_start.tv_sec) * 1000000000ULL +
-                        (ts_end.tv_nsec - ts_start.tv_nsec);
-    
+    uint64_t ns_delta = now_ns - t0_ns;
+
     if (ns_delta > 0) {
-        uint64_t freq = (tsc_delta * 1000000000ULL) / ns_delta;
-        if (freq > 1000000000ULL && freq < 10000000000ULL) {  // sanity check: 1-10 GHz
+        uint64_t freq = (tsc_finish - tsc_begin) * 1000000000ULL / ns_delta;
+        if (freq > 1000000000ULL && freq < 10000000000ULL) {  // sanity: 1-10 GHz
             return freq;
         }
     }
@@ -155,60 +142,100 @@ static uint64_t _detect_tsc_freq(void) {
 static void _init_once(void) {
     if (g_initialized) return;
     g_initialized = 1;
-    
-    // Detect TSC frequency
+
     g_tsc_freq_hz = _detect_tsc_freq();
-    
+
     memset(&g_ctx, 0, sizeof(g_ctx));
-    printf("TSC frequency: %.3f GHz\n", g_tsc_freq_hz / 1e9);
-    printf("Counter availability on this CPU:\n");
-    for (int i = 0; i < NC; i++) {
+    for (int i = 0; i < NC; i++) g_ctx.fd[i] = -1;
+
+    // Open CI_CYCLES as group leader - all 6 counters are controlled via this fd
+    // using PERF_IOC_FLAG_GROUP, ensuring atomic start/stop across all counters
+    {
         struct perf_event_attr pe = {0};
-        pe.type = DEFS[i].type; pe.size = sizeof(pe); pe.config = DEFS[i].config;
-        pe.disabled = 1; pe.exclude_kernel = 1; pe.exclude_hv = 1;
-        g_ctx.fd[i] = (int)_perf_open(&pe);
-        g_ctx.ok[i] = (g_ctx.fd[i] >= 0);
-        printf("  %s %s\n", g_ctx.ok[i] ? "✓" : "✗ (not on this CPU)", DEFS[i].name);
+        pe.type           = DEFS[CI_CYCLES].type;
+        pe.size           = sizeof(pe);
+        pe.config         = DEFS[CI_CYCLES].config;
+        pe.disabled       = 1;
+        pe.exclude_kernel = 1;
+        pe.exclude_hv     = 1;
+        pe.read_format    = PERF_FORMAT_TOTAL_TIME_ENABLED
+                          | PERF_FORMAT_TOTAL_TIME_RUNNING;
+        g_ctx.fd[CI_CYCLES] = (int)_perf_open(&pe, -1);
+        if (g_ctx.fd[CI_CYCLES] < 0) {
+            fprintf(stderr, "picoperf: failed to open group leader (cycles): %s\n"
+                            "picoperf: run: echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid\n",
+                    strerror(errno));
+            exit(1);
+        }
+        g_ctx.ok[CI_CYCLES] = 1;
     }
-    printf("\n");
+
+    // Open remaining counters as group members under CI_CYCLES leader
+    // The kernel schedules all group members together - no skew between counters
+    for (int i = 1; i < NC; i++) {
+        struct perf_event_attr pe = {0};
+        pe.type           = DEFS[i].type;
+        pe.size           = sizeof(pe);
+        pe.config         = DEFS[i].config;
+        pe.disabled       = 1;
+        pe.exclude_kernel = 1;
+        pe.exclude_hv     = 1;
+        pe.read_format    = PERF_FORMAT_TOTAL_TIME_ENABLED
+                          | PERF_FORMAT_TOTAL_TIME_RUNNING;
+        g_ctx.fd[i] = (int)_perf_open(&pe, g_ctx.fd[CI_CYCLES]);
+        g_ctx.ok[i] = (g_ctx.fd[i] >= 0);
+    }
 }
 
 // Main API - wrap your code with start/stop
 
-#define KEEP(x) __asm__ volatile("" : "+r,m"(x) :: "memory")
-
-void start_measuring(void) {
+__attribute__((noinline)) void start_measuring(void) {
     _init_once();
-    for (int i = 0; i < NC; i++) {
-        if (!g_ctx.ok[i]) continue;
-        ioctl(g_ctx.fd[i], PERF_EVENT_IOC_RESET, 0);
-        ioctl(g_ctx.fd[i], PERF_EVENT_IOC_ENABLE, 0);
-    }
+    ioctl(g_ctx.fd[CI_CYCLES], PERF_EVENT_IOC_RESET,  PERF_IOC_FLAG_GROUP);
+    ioctl(g_ctx.fd[CI_CYCLES], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
     g_t0 = tsc_start();
 }
 
-BenchResult stop_measuring(void) {
+__attribute__((noinline)) BenchResult stop_measuring(void) {
     uint64_t t1 = tsc_end();
-    
+    ioctl(g_ctx.fd[CI_CYCLES], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+
     for (int i = 0; i < NC; i++) {
         if (!g_ctx.ok[i]) { g_ctx.val[i] = 0; continue; }
-        ioctl(g_ctx.fd[i], PERF_EVENT_IOC_DISABLE, 0);
-        (void)!read(g_ctx.fd[i], &g_ctx.val[i], sizeof(uint64_t));
+        PerfReadBuf buf;
+        ssize_t n = read(g_ctx.fd[i], &buf, sizeof(buf));
+        if (n != (ssize_t)sizeof(buf)) {
+            fprintf(stderr, "picoperf: read failed for counter '%s': %s\n",
+                    DEFS[i].name, strerror(errno));
+            exit(1);
+        }
+        if (buf.time_running < buf.time_enabled) {
+            fprintf(stderr,
+                "picoperf: FATAL: multiplexing detected for counter '%s' "
+                "(time_running=%llu < time_enabled=%llu)\n"
+                "picoperf: results are interpolated, not real hardware counts - aborting\n"
+                "picoperf: reduce event count or check hardware PMC availability\n",
+                DEFS[i].name,
+                (unsigned long long)buf.time_running,
+                (unsigned long long)buf.time_enabled);
+            exit(1);
+        }
+        g_ctx.val[i] = buf.value;
     }
 
     BenchResult r = {0};
-    r.tsc_ticks = t1 - g_t0;
+    r.tsc_ticks   = t1 - g_t0;
     r.nanoseconds = (r.tsc_ticks * 1000000000ULL) / g_tsc_freq_hz;
     for (int i = 0; i < NC; i++) {
         r.c[i]  = g_ctx.val[i];
         r.ok[i] = g_ctx.ok[i];
     }
 
-    if (r.ok[CI_CYCLES] && r.c[CI_CYCLES]) {
-        r.ipc = (double)r.c[CI_INSTRS]  / r.c[CI_CYCLES];
-        r.cpi = (double)r.c[CI_CYCLES]  / r.c[CI_INSTRS];
+    if (r.ok[CI_CYCLES] && r.ok[CI_INSTRS] && r.c[CI_CYCLES] && r.c[CI_INSTRS]) {
+        r.ipc = (double)r.c[CI_INSTRS] / r.c[CI_CYCLES];
+        r.cpi = (double)r.c[CI_CYCLES] / r.c[CI_INSTRS];
     }
-    if (r.ok[CI_BRANCHES] && r.c[CI_BRANCHES])
+    if (r.ok[CI_BRANCHES] && r.ok[CI_BMISSES] && r.c[CI_BRANCHES])
         r.branch_miss_pct = 100.0 * r.c[CI_BMISSES] / r.c[CI_BRANCHES];
 
     return r;
@@ -271,12 +298,97 @@ void pin_to_cpu(int cpu_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
-    
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
-        printf("Thread pinned to CPU %d\n", cpu_id);
-    } else {
-        fprintf(stderr, "Warning: Failed to pin to CPU %d\n", cpu_id);
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
+        fprintf(stderr, "picoperf: failed to pin to CPU %d: %s\n",
+                cpu_id, strerror(errno));
+}
+
+void picoperf_setup(int cpu_id) {
+    _init_once();    // run before any measurement so first sample is clean
+    pin_to_cpu(cpu_id);
+
+    // Lock all current and future pages in RAM - prevents page faults mid-measurement
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        fprintf(stderr,
+            "picoperf: mlockall failed - page faults may spike latency during measurement\n"
+            "         run as root or: ulimit -l unlimited\n"
+            "         error: %s\n", strerror(errno));
+
+    // Real-time scheduling - prevents OS scheduler from preempting during measurement
+    struct sched_param sp = { .sched_priority = 1 };
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+        fprintf(stderr,
+            "picoperf: SCHED_FIFO failed - OS scheduler may preempt thread mid-measurement\n"
+            "         run as root for real-time scheduling\n"
+            "         error: %s\n", strerror(errno));
+
+    // SMT/Hyper-Threading - sibling thread on same physical core shares PMU counters
+    {
+        FILE *f = fopen("/sys/devices/system/cpu/smt/active", "r");
+        if (f) {
+            int active = 0;
+            if (fscanf(f, "%d", &active) == 1 && active)
+                fprintf(stderr,
+                    "picoperf: WARNING: SMT/Hyper-Threading is active\n"
+                    "         sibling thread shares PMU resources and execution ports\n"
+                    "         pollutes cycle/instruction counts unpredictably\n"
+                    "         disable: echo off | sudo tee /sys/devices/system/cpu/smt/control\n");
+            fclose(f);
+        }
     }
+
+    // CPU frequency governor - variable frequency makes cycle counts non-deterministic
+    {
+        FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "r");
+        if (f) {
+            char gov[64] = {0};
+            if (fscanf(f, "%63s", gov) == 1 && strcmp(gov, "performance") != 0)
+                fprintf(stderr,
+                    "picoperf: WARNING: CPU governor is '%s', not 'performance'\n"
+                    "         frequency scaling makes cycle counts non-deterministic\n"
+                    "         fix: sudo cpupower frequency-set -g performance\n", gov);
+            fclose(f);
+        }
+    }
+
+    // Intel turbo boost - CPU above base clock makes per-run cycle counts vary
+    {
+        FILE *f = fopen("/sys/devices/system/cpu/intel_pstate/no_turbo", "r");
+        if (f) {
+            int no_turbo = 0;
+            if (fscanf(f, "%d", &no_turbo) == 1 && !no_turbo)
+                fprintf(stderr,
+                    "picoperf: WARNING: Intel turbo boost is enabled\n"
+                    "         CPU can exceed base clock - cycle counts vary run to run\n"
+                    "         disable: echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo\n");
+            fclose(f);
+        }
+    }
+
+    // AMD boost
+    {
+        FILE *f = fopen("/sys/devices/system/cpu/cpufreq/boost", "r");
+        if (f) {
+            int boost = 0;
+            if (fscanf(f, "%d", &boost) == 1 && boost)
+                fprintf(stderr,
+                    "picoperf: WARNING: AMD boost is enabled\n"
+                    "         CPU can exceed base clock - cycle counts vary run to run\n"
+                    "         disable: echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost\n");
+            fclose(f);
+        }
+    }
+}
+
+void picoperf_fini(void) {
+    for (int i = 0; i < NC; i++) {
+        if (g_ctx.fd[i] >= 0) {
+            close(g_ctx.fd[i]);
+            g_ctx.fd[i] = -1;
+            g_ctx.ok[i] = 0;
+        }
+    }
+    g_initialized = 0;
 }
 
 // Overhead measurement - cost of empty start/stop

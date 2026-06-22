@@ -23,7 +23,6 @@ typedef struct {
     double   ipc;
     double   cpi;
     double   branch_miss_pct;
-    double   l1d_miss_pct;
     int      ok[NC];
 } BenchResult;
 
@@ -31,10 +30,12 @@ typedef struct {
 extern "C" {
 #endif
 
-void        start_measuring(void);
-BenchResult stop_measuring(void);
+__attribute__((noinline)) void        start_measuring(void);
+__attribute__((noinline)) BenchResult stop_measuring(void);
 void        print_measured_results(BenchResult r);
 void        pin_to_cpu(int cpu_id);
+void        picoperf_setup(int cpu_id);
+void        picoperf_fini(void);
 BenchResult measure_overhead(void);
 void        print_overhead_stats(int iterations);
 
