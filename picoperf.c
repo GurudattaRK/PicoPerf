@@ -355,7 +355,13 @@ BenchResult stop_measuring(void) {
 
     BenchResult r = {0};
     r.tsc_ticks   = t1 - g_t0;
-    r.nanoseconds = (r.tsc_ticks * 1000000000ULL) / g_tsc_freq_hz;
+    /*
+     * Convert TSC ticks to nanoseconds without overflowing 64 bits.
+     * tsc_ticks * 1e9 overflows once the region is longer than ~6 seconds
+     * on a 3 GHz CPU.  Do the division first, then multiply the remainder.
+     */
+    r.nanoseconds = (r.tsc_ticks / g_tsc_freq_hz) * 1000000000ULL +
+                    ((r.tsc_ticks % g_tsc_freq_hz) * 1000000000ULL) / g_tsc_freq_hz;
     for (int i = 0; i < NC; i++) {
         r.c[i]  = g_ctx.val[i];
         r.ok[i] = g_ctx.ok[i];
